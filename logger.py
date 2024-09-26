@@ -13,7 +13,7 @@ class Logger:
     def enable(self):
         self.disabled = False
 
-    def log(self, log_type, data):
+    def log(self, log_type, data=None):
         if self.disabled:
             return
 

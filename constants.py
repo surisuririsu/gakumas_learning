@@ -1,3 +1,17 @@
+DEBUFF_FIELDS = [
+    "doubleCostTurns",
+    "costIncrease",
+    "nullifyGenkiTurns",
+]
+
+COST_FIELDS = [
+    "stamina",
+    "goodConditionTurns",
+    "concentration",
+    "goodImpressionTurns",
+    "motivation",
+]
+
 EOT_DECREMENT_FIELDS = [
     "goodConditionTurns",
     "perfectConditionTurns",
@@ -34,6 +48,16 @@ LOGGED_FIELDS = (
     "doubleCardEffectCards",
     "nullifyGenkiTurns",
 )
+
+WHOLE_FIELDS = [
+    "stamina",
+    "genki",
+    "goodConditionTurns",
+    "perfectConditionTurns",
+    "concentration",
+    "goodImpressionTurns",
+    "motivation",
+]
 
 GRAPHED_FIELDS = (
     "stamina",

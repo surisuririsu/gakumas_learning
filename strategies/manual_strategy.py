@@ -11,8 +11,9 @@ class ManualStrategy:
         #   max_index = scores.index(max_score)
         #   selected_card_id = state['handCardIds'][max_index]
 
+        print(state["handCardIds"])
         scores = []
-        selected_card_id = int(input("Select card:"))
+        selected_card_id = int(input("Select card: "))
 
         return scores, selected_card_id
 

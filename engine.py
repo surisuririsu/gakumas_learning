@@ -1,6 +1,10 @@
 import copy
 import math
 import random
+import re
+from constants import COST_FIELDS
+from constants import DEBUFF_FIELDS
+from constants import WHOLE_FIELDS
 from constants import LOGGED_FIELDS
 from constants import INCREASE_TRIGGER_FIELDS
 from constants import DECREASE_TRIGGER_FIELDS
@@ -110,7 +114,7 @@ class Engine:
 
         turn_pool = []
         for t in remaining_turns:
-            turn_pool += [t for t in range(0, int(max(remaining_turns[t], 0)))]
+            turn_pool += [t for i in range(0, int(max(remaining_turns[t], 0)))]
 
         random_turns = []
         while len(turn_pool):
@@ -118,6 +122,8 @@ class Engine:
             turn = turn_pool[index]
             turn_pool = turn_pool[:index] + turn_pool[index + 1 :]
             random_turns.append(turn)
+
+        print([first_turn] + random_turns + last_three_turns)
 
         return [first_turn] + random_turns + last_three_turns
 
@@ -170,6 +176,162 @@ class Engine:
 
         return next_state
 
+    def is_card_usable(self, state, card_id):
+        card = SkillCards.get_by_id(card_id)
+
+        # Check conditions
+        for condition in card["conditions"]:
+            if not self._evaluate_condition(condition, state):
+                return False
+
+        # Check cost
+        preview_state = state.copy()
+        for cost in card["cost"]:
+            preview_state = self._execute_action(cost, preview_state)
+        for field in COST_FIELDS:
+            if preview_state[field] < 0:
+                return False
+
+        return True
+
+    def use_card(self, state, card_id):
+        if self.debug:
+            if not state["started"]:
+                raise Exception("Stage not started!")
+            if state["cardUsesRemaining"] < 1:
+                raise Exception("No card uses remaining!")
+            if state["turnsRemaining"] < 1:
+                raise Exception("No turns remaining!")
+            if card_id not in state["handCardIds"]:
+                raise Exception("Card is not in hand!")
+            if not self.is_card_usable(state, card_id):
+                raise Exception("Card is not usable!")
+
+        hand_index = state["handCardIds"].index(card_id)
+        card = SkillCards.get_by_id(card_id)
+
+        next_state = copy.deepcopy(state)
+
+        self.logger.debug("Using card", card_id, card["name"])
+        self.logger.log("entityStart", {"type": "skillCard", "id": card_id})
+
+        # Set usedCard variables
+        next_state["_usedCardId"] = card["id"]
+        next_state["usedCardId"] = card["id"] - 1 if card["upgraded"] else card["id"]
+        next_state["cardEffects"] = self._get_card_effects(card)
+
+        # Apply card cost
+        self.logger.debug("Applying cost", card["cost"])
+        next_state = self._execute_actions(card["cost"], next_state)
+
+        # Remove card from hand
+        next_state["handCardIds"] = (
+            next_state["handCardIds"][:hand_index]
+            + next_state["handCardIds"][hand_index + 1 :]
+        )
+        next_state["cardUsesRemaining"] -= 1
+
+        # Trigger events on card used
+        next_state = self._trigger_effects_for_phase("cardUsed", next_state)
+        if card["type"] == "active":
+            next_state = self._trigger_effects_for_phase("activeCardUsed", next_state)
+        elif card["type"] == "mental":
+            next_state = self._trigger_effects_for_phase("mentalCardUsed", next_state)
+
+        # Apply card effects
+        if next_state["doubleCardEffectCards"]:
+            next_state["doubleCardEffectCards"] -= 1
+            next_state = self._trigger_effects(card["effects"], next_state)
+        next_state = self._trigger_effects(card["effects"], next_state)
+
+        next_state["cardsUsed"] += 1
+        next_state["turnCardsUsed"] += 1
+
+        # Trigger events after card used
+        next_state = self._trigger_effects_for_phase("afterCardUsed", next_state)
+        if card["type"] == "active":
+            next_state = self._trigger_effects_for_phase(
+                "afterActiveCardUsed", next_state
+            )
+        elif card["type"] == "mental":
+            next_state = self._trigger_effects_for_phase(
+                "afterMentalCardUsed", next_state
+            )
+
+        # Reset usedCard variables
+        next_state["_usedCardId"] = None
+        next_state["usedCardId"] = None
+        next_state["cardEffects"] = []
+
+        self.logger.log("entityEnd", {"type": "skillCard", "id": card_id})
+
+        # Send card to discards or remove
+        if card["limit"]:
+            next_state["removedCardIds"].append(card["id"])
+        else:
+            next_state["discardedCardIds"].append(card["id"])
+
+        # End turn if no card uses left
+        if next_state["cardUsesRemaining"] < 1:
+            next_state = self.end_turn(next_state)
+
+        return next_state
+
+    def end_turn(self, state):
+        if self.debug:
+            if not state["started"]:
+                raise Exception("Stage not started!")
+            if state["turnsRemaining"] < 1:
+                raise Exception("No turns remaining!")
+
+        # Recover stamina if turn ended by player
+        if state["cardUsesRemaining"] > 0:
+            state["stamina"] = min(
+                state["stamina"] + 2, self.idol_config.params["stamina"]
+            )
+
+        state = self._trigger_effects_for_phase("endOfTurn", state)
+
+        # Reduce buff turns
+        for key in EOT_DECREMENT_FIELDS:
+            if key in state["freshBuffs"]:
+                del state["freshBuffs"][key]
+            else:
+                state[key] = max(state[key] - 1, 0)
+
+        # Reduce score buff turns
+        for i in range(0, len(state["scoreBuffs"])):
+            if state["scoreBuffs"][i]["fresh"]:
+                state["scoreBuffs"][i]["fresh"] = False
+            elif state["scoreBuffs"][i]["turns"]:
+                state["scoreBuffs"][i]["turns"] -= 1
+        state["scoreBuffs"] = [b for b in state["scoreBuffs"] if b["turns"] != 0]
+
+        # Reset one turn buffs
+        state["cardUsesRemaining"] = 0
+        state["turnCardsUsed"] = 0
+
+        # Decrement effect ttl and expire
+        for i in range(0, len(state["effects"])):
+            if state["effects"][i].get("ttl") == None:
+                break
+            state["effects"][i]["ttl"] = max(state["effects"][i]["ttl"] - 1, -1)
+
+        # Discard hand
+        state["discardedCardIds"] += state["handCardIds"]
+        state["handCardIds"] = []
+
+        state["turnsElapsed"] += 1
+        state["turnsRemaining"] -= 1
+
+        self.logger.push_graph_data(state)
+
+        # Start next turn
+        if state["turnsRemaining"] > 0:
+            state = self._start_turn(state)
+
+        return state
+
     def _start_turn(self, state):
         self.logger.debug("Starting turn", state["turnsElapsed"] + 1)
 
@@ -215,6 +377,27 @@ class Engine:
         self.logger.log("drawCard", {"type": "skillCard", "id": card_id})
         return state
 
+    def _recycle_discards(self, state):
+        state["deckCardIds"] = state["discardedCardIds"]
+        random.shuffle(state["deckCardIds"])
+        self.logger.debug("Recycled discard pile")
+        return state
+
+    def _set_score_buff(self, state, amount, turns=None):
+        pass
+
+    def _get_card_effects(self, card):
+        card_effects = []
+        for effect in card["effects"]:
+            if "phase" in effect or "actions" not in effect:
+                continue
+            for action in effect["actions"]:
+                tokens = re.split(r"([=!]?=|[<>]=?|[+\-*/%]=?|&)", action)
+                if not len(tokens) or not len(tokens[0]):
+                    continue
+                card_effects.append(tokens[0])
+        return card_effects
+
     def _set_effects(self, state, source_type, source_id, effects):
         for i in range(0, len(effects)):
             effect = effects[i].copy()
@@ -252,7 +435,7 @@ class Engine:
 
         for idx in state["triggeredEffects"]:
             effect_index = phase_effects[idx]["index"]
-            if state["effects"][effect_index]["limit"]:
+            if state["effects"][effect_index].get("limit"):
                 state["effects"][effect_index]["limit"] -= 1
 
         state["triggeredEffects"] = []
@@ -271,13 +454,13 @@ class Engine:
                 skip_next_effect = False
                 continue
 
-            if effect["phase"]:
+            if effect.get("phase"):
                 self.logger.log("setEffect")
 
                 state = self._set_effects(
                     state,
-                    "skillCardEffect" if state["_usedCardId"] else None,
-                    state["_usedCardId"],
+                    "skillCardEffect" if "_usedCardId" in state else None,
+                    state.get("_usedCardId"),
                     [effect],
                 )
                 continue
@@ -302,7 +485,7 @@ class Engine:
                         skip_next_effect = True
                     continue
 
-            if effect["sourceType"]:
+            if "sourceType" in effect:
                 self.logger.log(
                     "entityStart",
                     {
@@ -312,7 +495,7 @@ class Engine:
                 )
 
             # Execute actions
-            if effect["actions"]:
+            if "actions" in effect:
                 self.logger.debug("Executing actions", effect["actions"])
 
                 state = self._execute_actions(effect["actions"], state)
@@ -322,7 +505,7 @@ class Engine:
                 state["motivationMultiplier"] = 1
 
             # Set effects
-            if effect["effects"]:
+            if "effects" in effect:
                 self.logger.debug("Setting effects", effect["effects"])
 
                 self.logger.log("setEffect")
@@ -331,7 +514,7 @@ class Engine:
                     state, effect["sourceType"], effect["sourceId"], effect["effects"]
                 )
 
-            if effect["sourceType"]:
+            if "sourceType" in effect:
                 self.logger.log(
                     "entityEnd",
                     {"type": effect["sourceType"], "id": effect["sourceId"]},
@@ -342,6 +525,93 @@ class Engine:
         state["triggeredEffects"] = triggered_effects
 
         return state
+
+    def _evaluate_condition(self, condition, state):
+        result = self._evaluate_expression(
+            re.split(r"([=!]?=|[<>]=?|[+\-*/%]|&)", condition), state
+        )
+        self.logger.debug("Condition", condition, result)
+        return result
+
+    def _evaluate_expression(self, tokens, state):
+        variables = {
+            **state,
+            "isVocalTurn": state["turnType"] == "vocal",
+            "isDanceTurn": state["turnType"] == "dance",
+            "isVisualTurn": state["turnType"] == "visual",
+        }
+
+        def evaluate(tokens):
+            if len(tokens) == 1:
+                # Numeric constants
+                if re.search(r"^-?[\d]+(\.\d+)?$", tokens[0]):
+                    return float(tokens[0])
+
+                # Variables
+                return variables[tokens[0]]
+
+            # Set contains
+            if "&" in tokens:
+                if len(tokens) != 3:
+                    print("Invalid set contains")
+                return tokens[2] in variables[tokens[0]]
+
+            # Comparators (boolean operators)
+            cmp_index = next(
+                (i for i, t in enumerate(tokens) if re.search(r"[=!]=|[<>]=?", t)), -1
+            )
+            if cmp_index != -1:
+                lhs = evaluate(tokens[:cmp_index])
+                cmp = tokens[cmp_index]
+                rhs = evaluate(tokens[cmp_index + 1 :])
+
+                if cmp == "==":
+                    return lhs == rhs
+                elif cmp == "!=":
+                    return lhs != rhs
+                elif cmp == "<":
+                    return lhs < rhs
+                elif cmp == "<=":
+                    return lhs <= rhs
+                elif cmp == ">":
+                    return lhs > rhs
+                elif cmp == ">=":
+                    return lhs >= rhs
+                print("Unrecognized comparator", cmp)
+
+            # Add, subtract
+            as_index = next(
+                (i for i, t in enumerate(tokens) if re.search(r"[+\-]", t)), -1
+            )
+            if as_index != -1:
+                lhs = evaluate(tokens[:as_index])
+                op = tokens[as_index]
+                rhs = evaluate(tokens[as_index + 1 :])
+
+                if op == "+":
+                    return lhs + rhs
+                elif op == "-":
+                    return lhs - rhs
+                print("Unrecognized operator", op)
+
+            # Multiply, divide, modulo
+            md_index = next(
+                (i for i, t in enumerate(tokens) if re.search(r"[*/%]", t)), -1
+            )
+            if md_index != -1:
+                lhs = evaluate(tokens[:md_index])
+                op = tokens[md_index]
+                rhs = evaluate(tokens[md_index + 1 :])
+
+                if op == "*":
+                    return lhs * rhs
+                elif op == "/":
+                    return lhs / rhs
+                elif op == "%":
+                    return lhs % rhs
+                print("Unrecognized operator", op)
+
+        return evaluate(tokens)
 
     def _execute_actions(self, actions, state):
         prev = {key: state[key] for key in KEYS_TO_DIFF}
@@ -386,4 +656,131 @@ class Engine:
         return state
 
     def _execute_action(self, action, state):
-        pass
+        tokens = re.split(r"([=!]?=|[<>]=?|[+\-*/%]=?|&)", action)
+
+        # Non-assignment actions
+        if len(tokens) == 1:
+            if tokens[0] == "drawCard":
+                state = self._draw_card(state)
+            elif tokens[0].startswith("setScoreBuff"):
+                args = [float(m) for m in re.findall(r"[\d\.]+", tokens[0])]
+                state = self._set_score_buff(state, *args)
+            elif tokens[0] == "upgradeHand":
+                state = self._upgrade_hand(state)
+            elif tokens[0] == "exchangeHand":
+                state = self._exchange_hand(state)
+            elif tokens[0] == "addRandomUpgradedCardToHand":
+                state = self._add_random_upgraded_card_to_hand(state)
+            return state
+
+        # Assignments
+        assign_index = next(
+            (i for i, t in enumerate(tokens) if re.search(r"[+\-*/%]?=", t)), -1
+        )
+        if assign_index == 1:
+            lhs = tokens[0]
+            op = tokens[1]
+            rhs = self._evaluate_expression(tokens[2:], state)
+
+            if state["nullifyDebuff"] and lhs in DEBUFF_FIELDS:
+                state["nullifyDebuff"] -= 1
+                return state
+
+            if lhs == "score" and op == "+=":
+                lhs = "intermediateScore"
+            elif lhs == "genki" and op == "+=":
+                lhs = "intermediateGenki"
+            elif lhs == "stamina" and op == "-=":
+                lhs = "intermediateStamina"
+
+            if op == "=":
+                state[lhs] = rhs
+            elif op == "+=":
+                state[lhs] += rhs
+            elif op == "-=":
+                state[lhs] -= rhs
+            elif op == "*=":
+                state[lhs] *= rhs
+            elif op == "/=":
+                state[lhs] /= rhs
+            elif op == "%=":
+                state[lhs] %= rhs
+            else:
+                print("Unrecognized assignment operator", op)
+
+            if lhs == "cost":
+                cost = state["cost"]
+                if state["halfCostTurns"]:
+                    cost *= 0.5
+                if state["doubleCostTurns"]:
+                    cost *= 2
+                cost = math.ceil(cost)
+                cost += state["costReduction"]
+                cost -= state["costIncrease"]
+                cost = min(cost, 0)
+
+                state["genki"] += cost
+                cost = 0
+                if state["genki"] < 0:
+                    state["stamina"] += state["genki"]
+                    state["genki"] = 0
+            elif lhs == "intermediateStamina":
+                stamina = state["intermediateStamina"]
+                if state["halfCostTurns"]:
+                    stamina *= 0.5
+                if state["doubleCostTurns"]:
+                    stamina *= 2
+                stamina = math.ceil(stamina)
+                if stamina <= 0:
+                    stamina += state["costReduction"]
+                    stamina -= state["costIncrease"]
+                    stamina = min(stamina, 0)
+                state["stamina"] += stamina
+                state["intermediateStamina"] = 0
+            elif lhs == "intermediateScore":
+                score = state["intermediateScore"]
+                if score > 0:
+                    # Apply concentration
+                    score += state["concentration"] * state["concentrationMultiplier"]
+
+                    # Apply good and perfect condition
+                    if state["goodConditionTurns"]:
+                        score *= 1.5 + (
+                            (state["goodConditionTurns"] * 0.1)
+                            if state["perfectConditionTurns"]
+                            else 0
+                        )
+
+                    # Score buff effects
+                    score *= 1 + sum(b["amount"] for b in state["scoreBuffs"])
+                    score = math.ceil(score)
+
+                    # Turn type multiplier
+                    score *= self.idol_config.type_multipliers[state["turnType"]]
+                    score = math.ceil(score)
+                state["score"] += score
+                state["intermediateScore"] = 0
+            elif lhs == "intermediateGenki":
+                genki = state["intermediateGenki"]
+
+                # Apply motivation
+                genki += state["motivation"] * state["motivationMultiplier"]
+
+                if state["nullifyGenkiTurns"]:
+                    genki = 0
+
+                state["genki"] += genki
+                state["intermediateGenki"] = 0
+            elif lhs == "fixedGenki":
+                state["genki"] += state["fixedGenki"]
+                state["fixedGenki"] = 0
+            elif lhs == "fixedStamina":
+                state["stamina"] += state["fixedStamina"]
+                state["fixedStamina"] = 0
+
+            for key in WHOLE_FIELDS:
+                state[key] = math.ceil(state[key])
+        else:
+            print("Invalid action", action)
+
+        return state
