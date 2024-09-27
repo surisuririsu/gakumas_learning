@@ -1,5 +1,6 @@
 import itertools
 import math
+
 from game_data.p_idols import PIdols
 from game_data.p_items import PItems
 from game_data.skill_cards import SkillCards
@@ -98,7 +99,7 @@ class IdolConfig:
 
             multiplier = multiplier * criterion + 100
             multiplier = math.ceil(multiplier) * (1 + support_bonus)
-            multiplier = math.ceil(math.floor(multiplier * 10) / 100)
+            multiplier = math.ceil(math.floor(multiplier * 10) / 10)
             multipliers[key] = multiplier / 100
 
         return multipliers

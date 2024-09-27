@@ -1,5 +1,7 @@
 import json
+
 from effects import deserialize_effect_sequence
+
 
 with open("game_data/json/p_items.json", "r", encoding="utf-8") as f:
     p_items = json.load(f)

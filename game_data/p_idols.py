@@ -1,5 +1,6 @@
 import json
 
+
 with open("game_data/json/p_idols.json", "r", encoding="utf-8") as f:
     p_idols = json.load(f)
 

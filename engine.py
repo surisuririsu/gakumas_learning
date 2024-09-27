@@ -2,6 +2,7 @@ import copy
 import math
 import random
 import re
+
 from constants import COST_FIELDS
 from constants import DEBUFF_FIELDS
 from constants import WHOLE_FIELDS
@@ -11,6 +12,7 @@ from constants import DECREASE_TRIGGER_FIELDS
 from constants import EOT_DECREMENT_FIELDS
 from game_data.p_items import PItems
 from game_data.skill_cards import SkillCards
+
 
 KEYS_TO_DIFF = list(
     set(
@@ -122,8 +124,6 @@ class Engine:
             turn = turn_pool[index]
             turn_pool = turn_pool[:index] + turn_pool[index + 1 :]
             random_turns.append(turn)
-
-        print([first_turn] + random_turns + last_three_turns)
 
         return [first_turn] + random_turns + last_three_turns
 
@@ -314,7 +314,7 @@ class Engine:
         # Decrement effect ttl and expire
         for i in range(0, len(state["effects"])):
             if state["effects"][i].get("ttl") == None:
-                break
+                continue
             state["effects"][i]["ttl"] = max(state["effects"][i]["ttl"] - 1, -1)
 
         # Discard hand
@@ -367,6 +367,8 @@ class Engine:
         return state["deckCardIds"][-1]
 
     def _draw_card(self, state):
+        if len(state["handCardIds"]) >= 5:
+            return state
         if not len(state["deckCardIds"]):
             if not len(state["discardedCardIds"]):
                 return state
@@ -380,11 +382,69 @@ class Engine:
     def _recycle_discards(self, state):
         state["deckCardIds"] = state["discardedCardIds"]
         random.shuffle(state["deckCardIds"])
+        state["discardedCardIds"] = []
         self.logger.debug("Recycled discard pile")
         return state
 
+    def _upgrade_hand(self, state):
+        for i in range(0, len(state["handCardIds"])):
+            card = SkillCards.get_by_id(state["handCardIds"][i])
+            if not card["upgraded"] and card["type"] != "trouble":
+                state["handCardIds"][i] += 1
+        self.logger.log("upgradeHand")
+        return state
+
+    def _exchange_hand(self, state):
+        num_cards = len(state["handCardIds"])
+        state["discardedCardIds"] += state["handCardIds"]
+        state["handCardIds"] = []
+        for i in range(0, num_cards):
+            state = self._draw_card(state)
+        return state
+
+    def _add_random_upgraded_card_to_hand(self, state):
+        valid_base_cards = [
+            s
+            for s in SkillCards.get_filtered(
+                rarities=["R", "SR", "SSR"],
+                plans=[self.idol_config.plan, "free"],
+                source_types=["produce"],
+            )
+            if s["upgraded"]
+        ]
+        random_card = random.choice(valid_base_cards)
+        state["handCardIds"].append(random_card["id"])
+        self.logger.log(
+            "addRandomUpgradedCardToHand",
+            {
+                "type": "skillCard",
+                "id": random_card["id"],
+            },
+        )
+        return state
+
     def _set_score_buff(self, state, amount, turns=None):
-        pass
+        existing_buff_index = next(
+            (i for i, b in enumerate(state["scoreBuffs"]) if b["turns"] == turns), -1
+        )
+        if existing_buff_index != -1:
+            state["scoreBuffs"][existing_buff_index]["amount"] += amount
+        else:
+            state["scoreBuffs"].append(
+                {
+                    "amount": amount,
+                    "turns": turns,
+                    "fresh": state["phase"] != "startOfTurn",
+                }
+            )
+        self.logger.log(
+            "setScoreBuff",
+            {
+                "amount": amount,
+                "turns": turns,
+            },
+        )
+        return state
 
     def _get_card_effects(self, card):
         card_effects = []
@@ -443,6 +503,7 @@ class Engine:
         return state
 
     def _trigger_effects(self, effects, state):
+        prevState = state.copy()
         triggered_effects = []
         skip_next_effect = False
 
@@ -477,7 +538,7 @@ class Engine:
             if "conditions" in effect:
                 satisfied = True
                 for condition in effect["conditions"]:
-                    if not self._evaluate_condition(condition, state):
+                    if not self._evaluate_condition(condition, prevState):
                         satisfied = False
                         break
                 if not satisfied:
@@ -720,7 +781,7 @@ class Engine:
                 cost = min(cost, 0)
 
                 state["genki"] += cost
-                cost = 0
+                state["cost"] = 0
                 if state["genki"] < 0:
                     state["stamina"] += state["genki"]
                     state["genki"] = 0

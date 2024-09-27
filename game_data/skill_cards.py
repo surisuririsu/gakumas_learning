@@ -1,6 +1,8 @@
 import json
+
 from effects import deserialize_effect
 from effects import deserialize_effect_sequence
+
 
 with open("game_data/json/skill_cards.json", "r", encoding="utf-8") as f:
     skill_cards = json.load(f)

@@ -1,10 +1,11 @@
-from game_data.stages import Stages
 from engine import Engine
+from game_data.stages import Stages
+from idol_config import IdolConfig
 from logger import Logger
 from player import Player
-from idol_config import IdolConfig
 from stage_config import StageConfig
 from strategies.manual_strategy import ManualStrategy
+
 
 DEBUG = True
 
@@ -20,13 +21,15 @@ idol_config = IdolConfig(
     fallback_idol_id=3,
 )
 
+print(idol_config.type_multipliers)
+
 
 def simulate(stage_config, idol_config):
     logger = Logger(DEBUG)
     engine = Engine(stage_config, idol_config, logger, DEBUG)
     strategy = ManualStrategy(engine)
     result = Player(engine, strategy).play()
-    print(result)
+    print(result["score"])
 
 
 simulate(stage_config, idol_config)
